@@ -1,0 +1,273 @@
+import Std.Data.Int.Basic
+import Std.Data.List.Basic
+import Std.Data.Nat.Lemmas
+
+namespace Cryptography
+
+def egcd (a b : Nat) : Nat × Int × Int :=
+  if b = 0 then (a, 1, 0)
+  else
+    let (g, x, y) := egcd b (a % b)
+    (g, y, x - (Int.ofNat (a / b)) * y)
+
+def modInv (a m : Nat) : Option Nat :=
+  let (g, x, _) := egcd a m
+  if g = 1 then
+    let inv := (x % m.toInt + m.toInt) % m.toInt
+    some inv.toNat
+  else
+    none
+
+def modExp (base exp m : Nat) : Nat :=
+  let rec loop (b : Nat) (e : Nat) (result : Nat) : Nat :=
+    if e = 0 then result
+    else if e % 2 = 1 then
+      loop ((b * b) % m) (e / 2) ((result * b) % m)
+    else
+      loop ((b * b) % m) (e / 2) result
+  loop (base % m) exp 1
+
+def millerRabinWitness (n a : Nat) : Bool :=
+  let rec decompose (d s : Nat) : Nat × Nat :=
+    if d % 2 = 0 then decompose (d / 2) (s + 1)
+    else (d, s)
+  let (d, s) := decompose (n - 1) 0
+  let rec check (r : Nat) (s : Nat) : Bool :=
+    if s = 0 then false
+    else
+      let x := modExp a (d * (2^(r - 1)) : Nat) n
+      if x = 1 ∨ x = n - 1 then true
+      else if r = s then false
+      else check (r + 1) s
+  if n ≤ 4 then false else not (check 1 s)
+
+def isPrime (n : Nat) (k : Nat := 5) : Bool :=
+  if n < 2 then false
+  else if n = 2 ∨ n = 3 then true
+  else
+    let rec test (i : Nat) : Bool :=
+      if i = 0 then true
+      else
+        let a := 2 + (Nat.rand n) % (n - 3)
+        if millerRabinWitness n a then false
+        else test (i - 1)
+    test k
+
+def generatePrime (max : Nat) : IO Nat := do
+  let rec loop : IO Nat :=
+    let candidate ← IO.randNat max
+    if candidate < 2 then loop else
+    if isPrime candidate 5 then pure candidate else loop
+  loop
+
+structure RSAKeyPair where
+  publicKey : Nat × Nat
+  privateKey : Nat
+  deriving Repr
+
+def generateRSAKeyPair (maxPrime e : Nat) : IO (Option RSAKeyPair) := do
+  let p ← generatePrime maxPrime
+  let q ← generatePrime maxPrime
+  if p = q then
+    IO.println "Regenerating primes because p = q" 
+    generateRSAKeyPair maxPrime e
+  else
+    let n := p * q
+    let phi := (p - 1) * (q - 1)
+    if Nat.gcd e phi ≠ 1 then
+      IO.println "e is not coprime with phi(n), regenerating keys" 
+      generateRSAKeyPair maxPrime e
+    else
+      match modInv e phi with
+      | some d =>
+          pure (some { publicKey := (e, n), privateKey := d })
+      | none =>
+          pure none
+
+def encrypt (m : Nat) ((e, n) : Nat × Nat) : Nat :=
+  modExp m e n
+
+def decrypt (c : Nat) (d n : Nat) : Nat :=
+  modExp c d n
+
+end Cryptography
+
+namespace NeuralNetwork
+
+abbrev Vector := List Float
+
+abbrev Matrix := List (List Float)
+
+namespace Math
+
+def vectorAdd (v1 v2 : Vector) : Vector :=
+  List.zipWith (· + ·) v1 v2
+
+def vectorSub (v1 v2 : Vector) : Vector :=
+  List.zipWith (· - ·) v1 v2
+
+def scalarVector (s : Float) (v : Vector) : Vector :=
+  v.map (fun x => s * x)
+
+def dot (v1 v2 : Vector) : Float :=
+  List.zipWith (· * ·) v1 v2 |>.foldl (· + ·) 0.0
+
+def matMul (A : Matrix) (B : Matrix) : Matrix :=
+  let BT := List.transpose B
+  A.map (fun row => BT.map (dot row))
+
+def transpose (m : Matrix) : Matrix :=
+  List.transpose m
+
+def vectorInit (n : Nat) (f : Nat → Float) : Vector :=
+  List.range n |>.map f
+
+def matrixInit (rows cols : Nat) (f : Nat → Nat → Float) : Matrix :=
+  List.range rows |>.map (fun i => vectorInit cols (fun j => f i j))
+
+def vectorMap (f : Float → Float) (v : Vector) : Vector :=
+  v.map f
+
+def sumSquares (v : Vector) : Float :=
+  v.map (fun x => x * x) |>.foldl (· + ·) 0.0
+
+end Math
+
+open Math
+
+def relu (x : Float) : Float :=
+  if x > 0.0 then x else 0.0
+
+def reluDeriv (x : Float) : Float :=
+  if x > 0.0 then 1.0 else 0.0
+
+def sigmoid (x : Float) : Float :=
+  1.0 / (1.0 + Float.exp (-x))
+
+def sigmoidDeriv (x : Float) : Float :=
+  let s := sigmoid x
+  s * (1.0 - s)
+
+structure Layer where
+  weights : Matrix
+  biases  : Vector
+  deriving Repr
+
+structure NeuralNet where
+  layers : List Layer
+  deriving Repr
+
+def layerForward (layer : Layer) (input : Vector) (activation : Float → Float) : (Vector × Vector) :=
+  let z := (layer.weights.map (dot input)) |> vectorAdd layer.biases
+  let a := z.map activation
+  (a, z)
+
+def forward (net : NeuralNet) (input : Vector) (activation : Float → Float) : List (Vector × Vector) :=
+  net.layers.foldl (fun acc layer =>
+    let (prevA, _) := acc.head!
+    let (a, z) := layerForward layer prevA activation
+    ((a, z) :: acc)
+  ) [ (input, input) ] |> List.reverse
+
+def mseLoss (prediction target : Vector) : Float :=
+  let diff := vectorSub prediction target
+  (sumSquares diff) / (Float.ofNat (List.length diff))
+
+def layerBackward (input : Vector) (delta : Vector) (z : Vector)
+  (activationDeriv : Float → Float) (layer : Layer) : (Matrix × Vector × Vector) :=
+  let dZ := List.map2 (fun d z => d * activationDeriv z) delta z
+  let dW := dZ.map (fun dz => input.map (fun i => dz * i))
+  let dB := dZ
+  let weightsT := transpose layer.weights
+  let dA_prev := weightsT.map (fun row => dot row dZ)
+  (dW, dB, dA_prev)
+
+def updateLayer (layer : Layer) (dW : Matrix) (dB : Vector) (learningRate : Float) : Layer :=
+  let newWeights := List.zipWith (fun wRow dWRow => List.zipWith (fun w dw => w - learningRate * dw) wRow dWRow) layer.weights dW
+  let newBiases := List.zipWith (fun b db => b - learningRate * db) layer.biases dB
+  { weights := newWeights, biases := newBiases }
+
+def trainEpoch (net : NeuralNet) (input : Vector) (target : Vector)
+  (activation : Float → Float) (activationDeriv : Float → Float) (learningRate : Float)
+  : (NeuralNet × Float) :=
+  let activations := forward net input activation
+  let (output, _) := activations.reverse.head!
+  let loss := mseLoss output target
+  let deltaInit := List.map2 (fun o t => 2 * (o - t)) output target
+  let rec backprop (layers : List Layer) (acts : List (Vector × Vector)) (delta : Vector)
+    (accLayers : List Layer) : List Layer :=
+    match layers, acts with
+    | [], _ => accLayers
+    | (layer :: restLayers), (a, z) :: restActs =>
+      let (dW, dB, dA_prev) := layerBackward a delta z activationDeriv layer
+      let updatedLayer := updateLayer layer dW dB learningRate
+      backprop restLayers restActs dA_prev (updatedLayer :: accLayers)
+    | _, _ => accLayers
+  let newLayers := backprop net.layers (activations.drop 1) deltaInit []
+  ( { layers := newLayers.reverse }, loss )
+
+def train (net : NeuralNet) (dataset : List (Vector × Vector))
+  (activation : Float → Float) (activationDeriv : Float → Float)
+  (learningRate : Float) (epochs : Nat) : NeuralNet :=
+  let rec loop (net : NeuralNet) (epoch : Nat) : NeuralNet :=
+    if epoch = 0 then net
+    else
+      let (net', totalLoss) := dataset.foldl (fun (acc : NeuralNet × Float) (input, target) =>
+        let (netAcc, lossAcc) := acc
+        let (netNew, loss) := trainEpoch netAcc input target activation activationDeriv learningRate
+        (netNew, lossAcc + loss)
+      ) (net, 0.0)
+      let avgLoss := totalLoss / (Float.ofNat (List.length dataset))
+      IO.println s!"Epoch {epochs - epoch + 1}, Average Loss: {avgLoss}"
+      loop net' (epoch - 1)
+  loop net epochs
+
+def initLayer (inputSize outputSize : Nat) : IO Layer := do
+  let weights ← IO.println "Initializing weights" *> pure (matrixInit outputSize inputSize (fun _ _ => Float.rand ()))
+  let biases := vectorInit outputSize (fun _ => 0.0)
+  pure { weights := weights, biases := biases }
+
+def initNetwork (sizes : List Nat) : IO NeuralNet :=
+  let layerSizes := sizes.toArray.toList
+  let rec loop (lst : List Nat) (acc : List Layer) : IO (List Layer) :=
+    match lst with
+    | i :: j :: rest =>
+      let layer ← initLayer i j
+      loop (j :: rest) (acc ++ [layer])
+    | _ => pure acc
+  let layers ← loop layerSizes []
+  pure { layers := layers }
+
+end NeuralNetwork
+
+open Cryptography
+open NeuralNetwork
+
+def main : IO Unit := do
+  IO.println "=================== Cryptography Module ==================="
+  IO.println "Generating RSA Key Pair..."
+  match ← generateRSAKeyPair 1000 17 with
+  | some keyPair =>
+      IO.println s!"RSA Key Pair Generated: {keyPair}"
+      let message : Nat := 123
+      let ciphertext := encrypt message keyPair.publicKey
+      IO.println s!"Encrypted Message: {ciphertext}"
+      let decrypted := decrypt ciphertext keyPair.privateKey (keyPair.publicKey.2)
+      IO.println s!"Decrypted Message: {decrypted}"
+  | none =>
+      IO.println "RSA Key Generation Failed."
+
+  IO.println "\n=================== Neural Network Module ==================="
+  IO.println "Initializing Neural Network..."
+  let net ← initNetwork [3, 5, 4, 1]
+  let dataset : List (NeuralNetwork.Vector × NeuralNetwork.Vector) :=
+    [ ([0.5, 1.0, -0.5], [1.0]),
+      ([1.5, -0.5, 2.0], [0.0]),
+      ([0.0, 0.0, 0.0], [0.5]),
+      ([2.0, 1.0, 1.0], [1.0]) ]
+  IO.println "Starting Training for 50 Epochs..."
+  let trainedNet := train net dataset sigmoid sigmoidDeriv 0.01 50
+  IO.println "Training Completed."
+  pure ()
+
+#eval main
